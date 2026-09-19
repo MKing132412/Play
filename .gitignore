@@ -1,0 +1,13 @@
+node_modules/
+.next/
+.env
+.env*.local
+!.env.example
+coverage/
+npm-debug.log*
+data/rooms/
+data/scripts/
+outputs/
+work/
+.tools/
+*.tsbuildinfo
