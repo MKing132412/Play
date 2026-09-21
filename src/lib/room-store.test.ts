@@ -17,6 +17,12 @@ test("room links restore the assigned player without leaking other private roles
     };
     const created = await createOnlineRoom(script, "http://localhost", root);
     assert.equal(created.links.length, sampleScript.playerCount);
+    assert.notEqual(created.hostUrl, created.links[0].url);
+    assert.equal(created.links.every((link) => !link.canHost), true);
+    const hostSnapshot = await getRoomSnapshot(created.code, tokenOf(created.hostUrl), root);
+    assert.equal(hostSnapshot.viewer.playerId, null);
+    assert.equal(hostSnapshot.viewer.canHost, true);
+    assert.equal(hostSnapshot.script.roles.every((role) => !role.privateBrief && !role.sourcePages?.length), true);
     const snapshot = await getRoomSnapshot(created.code, tokenOf(created.links[1].url), root);
     assert.equal(snapshot.viewer.playerId, "player-2");
     assert.equal(snapshot.viewer.canHost, false);
@@ -36,13 +42,17 @@ test("server room persists phase and private clue across reads", async () => {
   try {
     const created = await createOnlineRoom(sampleScript, "http://localhost", root);
     const hostToken = tokenOf(created.hostUrl);
+    const playerToken = tokenOf(created.links[0].url);
     await applyRoomAction(created.code, hostToken, { type: "advance" }, root);
     await applyRoomAction(created.code, hostToken, { type: "advance" }, root);
-    const drawn = await applyRoomAction(created.code, hostToken, { type: "draw", deckId: "body" }, root);
+    await assert.rejects(applyRoomAction(created.code, hostToken, { type: "draw", deckId: "body" }, root), /房主席不参与搜证/);
+    const drawn = await applyRoomAction(created.code, playerToken, { type: "draw", deckId: "body" }, root);
     assert.equal(drawn.game.phaseIndex, 1);
     assert.equal(drawn.game.players[0].clueIds.length, 1);
     const restored = await getRoomSnapshot(created.code, hostToken, root);
-    assert.deepEqual(restored.game.players[0].clueIds, drawn.game.players[0].clueIds);
+    assert.deepEqual(restored.game.players[0].clueIds, []);
+    const playerRestored = await getRoomSnapshot(created.code, playerToken, root);
+    assert.deepEqual(playerRestored.game.players[0].clueIds, drawn.game.players[0].clueIds);
 
     const other = await getRoomSnapshot(created.code, tokenOf(created.links[1].url), root);
     assert.deepEqual(other.game.players[0].clueIds, []);

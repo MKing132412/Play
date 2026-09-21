@@ -5,6 +5,7 @@ node_modules/
 !.env.example
 coverage/
 npm-debug.log*
+*.log
 data/rooms/
 data/scripts/
 outputs/

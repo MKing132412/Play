@@ -8,7 +8,7 @@ import {
 import { startTransition, useEffect, useMemo, useRef, useState } from "react";
 import {
   advancePhase, availableSpecialTriggers, createGame, drawClue, triggerSpecialClue, validateScript, visibleContext,
-  allVotesSubmitted, clueCategory, clueQuota, clueTarget, type ClueCategory, type GameState, type ScriptPackage,
+  allVotesSubmitted, clueCategory, clueChoiceError, clueQuota, clueTarget, phaseAdvanceError, xiSearchTurn, type ClueCategory, type GameState, type ScriptPackage, type SearchTurn,
 } from "@/lib/domain";
 import { sampleScript } from "@/lib/sample";
 import { buildImportManifest, importPath, maxImportBytes, nestedImportRoots, selectImportFiles, type ImportManifest } from "@/lib/import-files";
@@ -670,10 +670,11 @@ function paginateBrief(text: string, limit = 900) {
   return pages;
 }
 
-export function GameRoom({ script, game, playerId, onPlayerChange, onGameChange, onDraw, onTriggerSpecial, onAdvance, onNotice, canHost = true, canSwitchPlayers = true, onlinePlayerIds, availableDeckIds, searchOptions, specialTriggers, dmRoom, onConclusion, onVote, onSetLeader, onSetActOneAccusation }: {
+export function GameRoom({ script, game, playerId, onPlayerChange, onGameChange, onDraw, onTriggerSpecial, onAdvance, onNotice, canHost = true, canSwitchPlayers = true, onlinePlayerIds, availableDeckIds, searchOptions, specialTriggers, searchTurn, advanceBlockedReason, dmRoom, onConclusion, onVote, onSetLeader, onSetActOneAccusation }: {
   script: ScriptPackage; game: GameState; playerId: string; onPlayerChange: (id: string) => void;
   onGameChange: (state: GameState) => void; onDraw: (deckId: string, category?: ClueCategory, targetRoleId?: string, targetClueId?: string) => void; onTriggerSpecial?: (clueId: string) => void; onAdvance: () => void; onNotice: (message: string) => void;
   canHost?: boolean; canSwitchPlayers?: boolean; onlinePlayerIds?: string[]; availableDeckIds?: string[]; searchOptions?: Array<{ clueId: string; deckId: string; title: string }>; specialTriggers?: Array<{ clueId: string; title: string }>;
+  searchTurn?: SearchTurn; advanceBlockedReason?: string;
   dmRoom?: { roomCode: string; token: string };
   onConclusion?: (text: string) => void; onVote?: (roleId: string) => void; onSetLeader?: (roleId: string) => void; onSetActOneAccusation?: (roleId: string) => void;
 }) {
@@ -706,6 +707,8 @@ export function GameRoom({ script, game, playerId, onPlayerChange, onGameChange,
   const endingCondition = winningRole?.id === script.truth.culpritRoleId ? "solved" : script.id === "k2-dark-legend" && winningRole?.id === "gray" ? "framed" : "escaped";
   const ending = script.id === "xi-liangxi-phantom" && winningRole ? script.endings.find((item) => item.id === `vote-${winningRole.id}`) : script.endings.find((item) => item.condition === endingCondition);
   const triggerOptions = specialTriggers ?? availableSpecialTriggers(script, game, playerId);
+  const effectiveSearchTurn = searchTurn ?? xiSearchTurn(script, game);
+  const effectiveAdvanceBlockedReason = advanceBlockedReason ?? phaseAdvanceError(script, game);
   const gatedBrief = useMemo(() => phaseBrief(role.privateBrief, game.phaseIndex, game.status, script.id), [role.privateBrief, game.phaseIndex, game.status, script.id]);
   const briefPages = useMemo(() => paginateBrief(briefView === "role" ? gatedBrief.role : gatedBrief.flow), [gatedBrief, briefView]);
   const visibleSourcePages = useMemo(() => {
@@ -808,7 +811,7 @@ export function GameRoom({ script, game, playerId, onPlayerChange, onGameChange,
         <div className="phase-header">
           <div className="phase-number">{String(game.phaseIndex + 1).padStart(2, "0")}</div>
           <div><p>当前阶段 · {game.status === "lobby" ? "等待开始" : game.status === "finished" ? "游戏结束" : "进行中"}</p><h1>{phase.name}</h1><span>{phase.objective}</span></div>
-          <div className="phase-actions"><button className="secondary-button"><Clock3 size={17} />{phase.durationMinutes}:00</button>{game.status === "finished" ? <span className="waiting-host">游戏已结束</span> : canHost ? <button className="primary-button" onClick={onAdvance} disabled={votingPhase && !allVotesSubmitted(game)}>{game.status === "lobby" ? "开始游戏" : game.phaseIndex === script.phases.length - 1 ? `等待投票 ${votesSubmitted}/${game.players.length}` : "推进阶段"}<ChevronRight size={17} /></button> : <span className="waiting-host">等待房主推进</span>}</div>
+          <div className="phase-actions"><button className="secondary-button"><Clock3 size={17} />{phase.durationMinutes}:00</button>{game.status === "finished" ? <span className="waiting-host">游戏已结束</span> : canHost ? <button className="primary-button" onClick={onAdvance} disabled={(votingPhase && !allVotesSubmitted(game)) || Boolean(effectiveAdvanceBlockedReason)} title={effectiveAdvanceBlockedReason || undefined}>{game.status === "lobby" ? "开始游戏" : effectiveAdvanceBlockedReason ? "等待搜证完成" : game.phaseIndex === script.phases.length - 1 ? `等待投票 ${votesSubmitted}/${game.players.length}` : "推进阶段"}<ChevronRight size={17} /></button> : <span className="waiting-host">等待房主推进</span>}</div>
         </div>
 
         <div className="dm-broadcast"><Bot size={24} /><div><strong>DM 广播</strong><p>{phase.hostPrompt}</p></div><span>系统触发</span></div>
@@ -863,14 +866,16 @@ export function GameRoom({ script, game, playerId, onPlayerChange, onGameChange,
                     return [<div className="targeted-draw" key={deck.id}><span><Map size={19} /><strong>{deck.name}</strong></span><small>{searchStatus}</small><select aria-label="选择搜查对象" value={searchTargetRoleId} onChange={(event) => setSearchTargetRoleId(event.target.value)} disabled={!canSearch}><option value="">选择搜查对象</option>{script.roles.filter((candidate) => candidate.id !== role.id && candidate.id !== leaderRole?.id).map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}</select><button disabled={!canSearch || !searchTargetRoleId} onClick={() => onDraw(deck.id, undefined, searchTargetRoleId)}><Search size={16} />随机取得 1 件</button></div>];
                   }
                   if (deck.id === "rooms" && phase.id === "act-two") {
-                    const choices = searchOptions ?? script.clues.filter((clue) => clue.deckId === deck.id && !owned.has(clue.id)).map((clue) => ({ clueId: clue.id, deckId: clue.deckId, title: clue.title }));
+                    const choices = searchOptions ?? script.clues.filter((clue) => clue.deckId === deck.id && !owned.has(clue.id) && !clueChoiceError(script, game, player, clue)).map((clue) => ({ clueId: clue.id, deckId: clue.deckId, title: clue.title }));
                     return [<div className="targeted-draw" key={deck.id}><span><Map size={19} /><strong>{deck.name}</strong></span><small>{used >= deck.drawLimitPerPlayer ? "本阶段已完成搜查" : "按角色密档限制选择一处地点"}</small><select aria-label="选择搜查地点" value={searchTargetClueId} onChange={(event) => setSearchTargetClueId(event.target.value)} disabled={!enabled}><option value="">选择搜查地点</option>{choices.map((choice) => <option key={choice.clueId} value={choice.clueId}>{choice.title}</option>)}</select><button disabled={!enabled || !searchTargetClueId} onClick={() => onDraw(deck.id, undefined, undefined, searchTargetClueId)}><Search size={16} />搜查此处</button></div>];
                   }
                   if (deck.id === "deep-investigation" && script.id === "xi-liangxi-phantom") {
-                    const choices = searchOptions ?? script.clues.filter((clue) => clue.deckId === deck.id && !owned.has(clue.id)).map((clue) => ({ clueId: clue.id, deckId: clue.deckId, title: clue.title }));
-                    return [<div className="targeted-draw" key={deck.id}><span><Map size={19} /><strong>{deck.name}</strong></span><small>仅按已获得线索卡上的编号指引开启</small><select aria-label="选择深入调查编号" value={searchTargetClueId} onChange={(event) => setSearchTargetClueId(event.target.value)} disabled={!hasAvailable}><option value="">选择指定编号</option>{choices.map((choice) => <option key={choice.clueId} value={choice.clueId}>{choice.title}</option>)}</select><button disabled={!hasAvailable || !searchTargetClueId} onClick={() => onDraw(deck.id, undefined, undefined, searchTargetClueId)}><Search size={16} />开启调查</button></div>];
+                    const choices = searchOptions ?? script.clues.filter((clue) => clue.deckId === deck.id && !owned.has(clue.id) && !clueChoiceError(script, game, player, clue)).map((clue) => ({ clueId: clue.id, deckId: clue.deckId, title: clue.title }));
+                    const deepAvailable = choices.length > 0;
+                    return [<div className="targeted-draw" key={deck.id}><span><Map size={19} /><strong>{deck.name}</strong></span><small>集齐卡面前置线索并达成卡面要求的玩家同意后开启</small><select aria-label="选择深入调查编号" value={searchTargetClueId} onChange={(event) => setSearchTargetClueId(event.target.value)} disabled={!deepAvailable}><option value="">{deepAvailable ? "选择已解锁编号" : "暂无满足条件的编号"}</option>{choices.map((choice) => <option key={choice.clueId} value={choice.clueId}>{choice.title}</option>)}</select><button disabled={!deepAvailable || !searchTargetClueId} onClick={() => onDraw(deck.id, undefined, undefined, searchTargetClueId)}><Search size={16} />开启调查</button></div>];
                   }
-                  return [<button key={deck.id} disabled={!enabled} onClick={() => onDraw(deck.id)}><span><Map size={19} /><strong>{deck.name}</strong></span><small>{hasAvailable ? `剩余 ${Math.max(0, deck.drawLimitPerPlayer - used)} 次` : "暂无可用线索"}</small><Search size={17} /></button>];
+                  const waitingForTurn = hasAvailable && effectiveSearchTurn && effectiveSearchTurn.roleId !== role.id;
+                  return [<button key={deck.id} disabled={!enabled || Boolean(waitingForTurn)} onClick={() => onDraw(deck.id)}><span><Map size={19} /><strong>{deck.name}</strong></span><small>{waitingForTurn ? `等待 ${effectiveSearchTurn.roleName} 搜证` : hasAvailable ? `剩余 ${Math.max(0, deck.drawLimitPerPlayer - used)} 次` : "暂无可用线索"}</small><Search size={17} /></button>];
                 }
                 return categories.map((category) => {
                   const ownedCount = clues.filter((clue) => clueCategory(clue) === category).length;

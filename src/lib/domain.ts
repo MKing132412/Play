@@ -190,6 +190,19 @@ const xiDeckByPhase: Record<string, string> = {
   "round-three": "huoqi",
 };
 
+const xiDrawOrderByPhase: Record<string, string[]> = {
+  "round-one": ["madam-lin", "lin-fengyu", "jiang-biyu", "han-jiaming", "lin-xue"],
+  "round-two": ["lin-xue", "han-jiaming", "jiang-biyu", "lin-fengyu", "madam-lin"],
+};
+
+const xiDeepRequirements: Record<string, string[]> = {
+  "deep-01": ["clue-13", "clue-41"],
+  "deep-02": ["clue-26"],
+  "deep-03": ["clue-43", "clue-49"],
+  "deep-04": ["clue-51", "clue-70"],
+  "deep-05": ["clue-45", "clue-53"],
+};
+
 const xiDeepClueOwner: Record<string, string> = {
   "deep-06": "lin-xue",
   "deep-07": "lin-fengyu",
@@ -197,6 +210,34 @@ const xiDeepClueOwner: Record<string, string> = {
   "deep-09": "madam-lin",
   "deep-10": "han-jiaming",
 };
+
+export type SearchTurn = { roleId: string; roleName: string; remaining: number };
+
+export function xiSearchTurn(script: ScriptPackage, state: GameState): SearchTurn | undefined {
+  if (script.id !== "xi-liangxi-phantom") return undefined;
+  const phaseId = script.phases[state.phaseIndex]?.id;
+  const order = xiDrawOrderByPhase[phaseId];
+  const deckId = xiDeckByPhase[phaseId];
+  const deck = script.clueDecks.find((item) => item.id === deckId);
+  if (!order || !deck) return undefined;
+  for (const roleId of order) {
+    const player = state.players.find((item) => item.roleId === roleId);
+    const role = script.roles.find((item) => item.id === roleId);
+    if (!player || !role) continue;
+    const drawn = player.clueIds.filter((id) => script.clues.find((clue) => clue.id === id)?.deckId === deckId).length;
+    if (drawn < deck.drawLimitPerPlayer) return { roleId, roleName: role.name, remaining: deck.drawLimitPerPlayer - drawn };
+  }
+  return undefined;
+}
+
+export function phaseAdvanceError(script: ScriptPackage, state: GameState) {
+  if (state.status !== "playing" || script.id !== "xi-liangxi-phantom") return "";
+  const deckId = xiDeckByPhase[script.phases[state.phaseIndex]?.id];
+  const deck = script.clueDecks.find((item) => item.id === deckId);
+  if (!deck) return "";
+  const unfinished = state.players.filter((player) => player.clueIds.filter((id) => script.clues.find((clue) => clue.id === id)?.deckId === deckId).length < deck.drawLimitPerPlayer);
+  return unfinished.length ? `还有 ${unfinished.length} 名玩家尚未完成本轮搜证` : "";
+}
 
 function xiClueAllowedForPlayer(script: ScriptPackage, player: PlayerState, clue: Clue) {
   const roleName = script.roles.find((role) => role.id === player.roleId)?.name;
@@ -228,8 +269,12 @@ function xiDeckRemainsAllocatable(script: ScriptPackage, state: GameState, deck:
 
 export function clueChoiceError(script: ScriptPackage, state: GameState, player: PlayerState, clue: Clue) {
   if (script.id === "xi-liangxi-phantom" && clue.deckId === "deep-investigation") {
-    const owner = xiDeepClueOwner[clue.id];
-    if (owner && owner !== player.roleId) return "这张深入调查线索属于其他角色";
+    if (xiDeepClueOwner[clue.id]) return "这张角色专属线索只随曲径通幽 01 自动发放";
+    const required = xiDeepRequirements[clue.id];
+    if (!required) return "深入调查编号不存在";
+    const owned = new Set(state.players.flatMap((item) => item.clueIds));
+    if (!required.every((id) => owned.has(id))) return "尚未集齐卡面要求的前置线索";
+    if (!required.some((id) => player.clueIds.includes(id))) return "请由持有前置线索的玩家开启调查";
     return "";
   }
   if (script.id !== "k2-dark-legend" || script.phases[state.phaseIndex]?.id !== "act-two" || clue.deckId !== "rooms") return "";
@@ -256,6 +301,8 @@ export function drawClue(script: ScriptPackage, state: GameState, playerId: stri
     const phaseDeck = xiDeckByPhase[script.phases[state.phaseIndex]?.id];
     if (deckId !== phaseDeck && deckId !== "deep-investigation") throw new Error("当前阶段不能抽取这组线索");
     if (deckId === "deep-investigation" && !targetClue) throw new Error("请选择卡面指引指定的深入调查编号");
+    const turn = deckId === phaseDeck ? xiSearchTurn(script, state) : undefined;
+    if (turn && turn.roleId !== player.roleId) throw new Error(`请等待${turn.roleName}完成本轮搜证`);
   }
   if (script.id === "k2-dark-legend" && script.phases[state.phaseIndex]?.id === "act-two" && deckId !== "rooms") throw new Error("当前阶段只能搜查地点线索");
   if (script.id === "k2-dark-legend" && script.phases[state.phaseIndex]?.id === "act-two" && deckId === "rooms" && !targetClue) throw new Error("请选择要搜查的地点");
@@ -302,13 +349,31 @@ export function drawClue(script: ScriptPackage, state: GameState, playerId: stri
   };
 }
 
+export function visibleRoleForPhase(script: ScriptPackage, state: GameState, role: Role): Role {
+  if (script.id !== "xi-liangxi-phantom") return role;
+  if (state.status === "lobby") return { ...role, privateBrief: "", objectives: [], sourcePages: [] };
+  const marker = role.privateBrief.search(/\n\*?游戏流程\*?\s*$/m);
+  const story = marker < 0 ? role.privateBrief : role.privateBrief.slice(0, marker).trim();
+  const flow = marker < 0 ? "" : role.privateBrief.slice(marker).trim();
+  const secondStory = story.search(/>>第二阶段故事<</);
+  const visibleStory = state.phaseIndex < 2 && secondStory >= 0 ? story.slice(0, secondStory).trim() : story;
+  const sections = [...flow.matchAll(/>>([^<]+)<</g)].map((match, index, matches) => flow.slice(match.index ?? 0, matches[index + 1]?.index ?? flow.length).trim());
+  const visibleFlow = sections.slice(0, state.phaseIndex + 1).join("\n\n");
+  return {
+    ...role,
+    privateBrief: [visibleStory, visibleFlow ? `*游戏流程*\n${visibleFlow}` : ""].filter(Boolean).join("\n\n"),
+    objectives: state.phaseIndex >= 2 ? role.objectives : [],
+    sourcePages: state.phaseIndex < 2 ? role.sourcePages?.slice(0, 13) : role.sourcePages,
+  };
+}
+
 export function visibleContext(script: ScriptPackage, state: GameState, playerId: string) {
   const player = state.players.find((item) => item.id === playerId);
   if (!player) throw new Error("玩家不存在");
   const role = script.roles.find((item) => item.id === player.roleId);
   return {
     phase: script.phases[state.phaseIndex],
-    role,
+    role: role ? visibleRoleForPhase(script, state, role) : undefined,
     privateClues: script.clues.filter((clue) => player.clueIds.includes(clue.id)),
     publicClues: script.clues.filter((clue) => state.publicClueIds.includes(clue.id)),
     rules: script.clueDecks,
@@ -323,6 +388,8 @@ export function advancePhase(script: ScriptPackage, state: GameState): GameState
     if (!allVotesSubmitted(state)) throw new Error("请等待所有玩家完成最终指认");
     return { ...state, status: "finished" };
   }
+  const blocked = phaseAdvanceError(script, state);
+  if (blocked) throw new Error(blocked);
   const next = state.phaseIndex + 1;
   return { ...state, status: "playing", phaseIndex: next, eventLog: [...state.eventLog, `进入${script.phases[next].name}`] };
 }

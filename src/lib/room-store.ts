@@ -2,9 +2,9 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
-  advancePhase, allVotesSubmitted, availableSpecialTriggers, clueCategory, clueChoiceError, clueTarget, createGame, drawClue, triggerSpecialClue, visibleContext,
+  advancePhase, allVotesSubmitted, availableSpecialTriggers, clueCategory, clueChoiceError, clueTarget, createGame, drawClue, phaseAdvanceError, triggerSpecialClue, visibleContext, visibleRoleForPhase, xiSearchTurn,
   type ClueCategory,
-  type GameState, type ScriptPackage, type SpecialTrigger,
+  type GameState, type ScriptPackage, type SearchTurn, type SpecialTrigger,
 } from "./domain";
 
 type RoomRecord = {
@@ -13,12 +13,14 @@ type RoomRecord = {
   updatedAt: string;
   script: ScriptPackage;
   game: GameState;
-  hostPlayerId: string;
+  hostPlayerId?: string;
+  hostTokenHash?: string;
+  inviteTokens?: Record<string, string>;
   tokenHashes: Record<string, string>;
   lastSeen: Record<string, string>;
 };
 
-export type RoomViewer = { playerId: string; canHost: boolean };
+export type RoomViewer = { playerId: string | null; canHost: boolean };
 export type RoomSnapshot = {
   revision: number;
   script: ScriptPackage;
@@ -28,6 +30,9 @@ export type RoomSnapshot = {
   availableDeckIds: string[];
   searchOptions: Array<{ clueId: string; deckId: string; title: string }>;
   specialTriggers: SpecialTrigger[];
+  searchTurn?: SearchTurn;
+  advanceBlockedReason: string;
+  inviteLinks?: Array<{ playerId: string; roleName: string; url: string; canHost: false }>;
 };
 
 export type RoomAction =
@@ -122,15 +127,24 @@ async function locked<T>(code: string, operation: () => Promise<T>): Promise<T> 
 
 function authenticate(room: RoomRecord, token: string): RoomViewer {
   const digest = hashToken(token);
+  if (room.hostTokenHash === digest) return { playerId: null, canHost: true };
   const playerId = Object.entries(room.tokenHashes).find(([, candidate]) => candidate === digest)?.[0];
   if (!playerId) throw new Error("玩家链接无效");
+  if (!room.hostTokenHash && room.game.status === "lobby" && playerId === room.hostPlayerId) {
+    const inviteTokens = Object.fromEntries(room.game.players.map((player) => [player.id, randomBytes(24).toString("base64url")]));
+    room.hostTokenHash = digest;
+    room.inviteTokens = inviteTokens;
+    room.tokenHashes = Object.fromEntries(Object.entries(inviteTokens).map(([id, value]) => [id, hashToken(value)]));
+    delete room.hostPlayerId;
+    return { playerId: null, canHost: true };
+  }
   return { playerId, canHost: playerId === room.hostPlayerId };
 }
 
 function snapshot(room: RoomRecord, viewer: RoomViewer): RoomSnapshot {
-  const viewerPlayer = room.game.players.find((player) => player.id === viewer.playerId)!;
-  const visibleClueIds = new Set([...viewerPlayer.clueIds, ...room.game.publicClueIds]);
-  const publicRole = room.script.roles.map((role) => role.id === viewerPlayer.roleId ? role : { ...role, privateBrief: "", objectives: [], sourcePages: [] });
+  const viewerPlayer = viewer.playerId ? room.game.players.find((player) => player.id === viewer.playerId) : undefined;
+  const visibleClueIds = new Set([...(viewerPlayer?.clueIds ?? []), ...room.game.publicClueIds]);
+  const publicRole = room.script.roles.map((role) => role.id === viewerPlayer?.roleId ? visibleRoleForPhase(room.script, room.game, role) : { ...role, privateBrief: "", objectives: [], sourcePages: [] });
   const publicScript: ScriptPackage = {
     ...room.script,
     roles: publicRole,
@@ -143,28 +157,38 @@ function snapshot(room: RoomRecord, viewer: RoomViewer): RoomSnapshot {
     players: room.game.players.map((player) => player.id === viewer.playerId ? player : { ...player, clueIds: [] }),
   };
   const owned = new Set(room.game.players.flatMap((player) => player.clueIds));
-  const availableDeckIds = room.script.clueDecks.filter((deck) => room.script.clues.some((clue) =>
+  const availableDeckIds = viewerPlayer ? room.script.clueDecks.filter((deck) => room.script.clues.some((clue) =>
     clue.deckId === deck.id &&
     room.script.phases.findIndex((phase) => phase.id === clue.availableFromPhase) <= room.game.phaseIndex &&
-    !owned.has(clue.id)
-  )).map((deck) => deck.id);
-  const searchOptions = room.script.clues.filter((clue) =>
+    !owned.has(clue.id) &&
+    !clueChoiceError(room.script, room.game, viewerPlayer, clue)
+  )).map((deck) => deck.id) : [];
+  const searchOptions = viewerPlayer ? room.script.clues.filter((clue) =>
     (clue.deckId === "rooms" || (room.script.id === "xi-liangxi-phantom" && clue.deckId === "deep-investigation")) &&
     room.script.phases.findIndex((phase) => phase.id === clue.availableFromPhase) <= room.game.phaseIndex &&
     !owned.has(clue.id) &&
     !clueChoiceError(room.script, room.game, viewerPlayer, clue)
-  ).map((clue) => ({ clueId: clue.id, deckId: clue.deckId, title: clue.title }));
-  const specialTriggers = availableSpecialTriggers(room.script, room.game, viewer.playerId);
+  ).map((clue) => ({ clueId: clue.id, deckId: clue.deckId, title: clue.title })) : [];
+  const specialTriggers = viewer.playerId ? availableSpecialTriggers(room.script, room.game, viewer.playerId) : [];
+  const searchTurn = xiSearchTurn(room.script, room.game);
   const onlineThreshold = Date.now() - 15_000;
   return {
     revision: room.revision,
     script: publicScript,
     game: publicGame,
     viewer,
-    onlinePlayerIds: Object.entries(room.lastSeen).filter(([, timestamp]) => Date.parse(timestamp) >= onlineThreshold).map(([playerId]) => playerId),
+    onlinePlayerIds: Object.entries(room.lastSeen).filter(([playerId, timestamp]) => playerId !== "host" && Date.parse(timestamp) >= onlineThreshold).map(([playerId]) => playerId),
     availableDeckIds,
     searchOptions,
     specialTriggers,
+    searchTurn,
+    advanceBlockedReason: phaseAdvanceError(room.script, room.game),
+    inviteLinks: viewer.canHost && room.inviteTokens ? room.game.players.map((player) => ({
+      playerId: player.id,
+      roleName: room.script.roles.find((role) => role.id === player.roleId)?.name ?? player.name,
+      url: `/room/${room.code}#token=${room.inviteTokens![player.id]}`,
+      canHost: false as const,
+    })) : undefined,
   };
 }
 
@@ -178,13 +202,15 @@ export async function createOnlineRoom(script: ScriptPackage, origin: string, ov
   const game = createGame(script, script.roles.map((_, index) => `玩家 ${index + 1}`));
   game.roomCode = code;
   const rawTokens = Object.fromEntries(game.players.map((player) => [player.id, randomBytes(24).toString("base64url")]));
+  const hostToken = randomBytes(24).toString("base64url");
   const record: RoomRecord = {
     code,
     revision: 1,
     updatedAt: new Date().toISOString(),
     script,
     game,
-    hostPlayerId: game.players[0].id,
+    hostTokenHash: hashToken(hostToken),
+    inviteTokens: rawTokens,
     tokenHashes: Object.fromEntries(Object.entries(rawTokens).map(([playerId, token]) => [playerId, hashToken(token)])),
     lastSeen: {},
   };
@@ -193,16 +219,16 @@ export async function createOnlineRoom(script: ScriptPackage, origin: string, ov
     playerId: player.id,
     roleName: script.roles[index].name,
     url: `${origin}/room/${code}#token=${rawTokens[player.id]}`,
-    canHost: player.id === record.hostPlayerId,
+    canHost: false,
   }));
-  return { code, links, hostUrl: links[0].url };
+  return { code, links, hostUrl: `${origin}/room/${code}#token=${hostToken}` };
 }
 
 export async function getRoomSnapshot(code: string, token: string, override?: string) {
   return locked(code, async () => {
     const room = await readRoom(code, override);
     const viewer = authenticate(room, token);
-    room.lastSeen[viewer.playerId] = new Date().toISOString();
+    room.lastSeen[viewer.playerId ?? "host"] = new Date().toISOString();
     await writeRoom(room, override);
     return snapshot(room, viewer);
   });
@@ -212,14 +238,16 @@ export async function applyRoomAction(code: string, token: string, action: RoomA
   return locked(code, async () => {
     const room = await readRoom(code, override);
     const viewer = authenticate(room, token);
-    const player = room.game.players.find((item) => item.id === viewer.playerId)!;
+    const player = viewer.playerId ? room.game.players.find((item) => item.id === viewer.playerId) : undefined;
     const phase = room.script.phases[room.game.phaseIndex];
 
     if (action.type === "rename") {
+      if (!player) throw new Error("房主席不使用玩家昵称");
       const name = action.name.trim().slice(0, 20);
       if (!name) throw new Error("玩家昵称不能为空");
       player.name = name;
     } else if (action.type === "ready") {
+      if (!player) throw new Error("房主席没有准备状态");
       player.ready = action.ready;
     } else if (action.type === "setLeader") {
       if (!viewer.canHost) throw new Error("只有房主可以登记 Leader");
@@ -246,16 +274,20 @@ export async function applyRoomAction(code: string, token: string, action: RoomA
       }
       room.game = advancePhase(room.script, room.game);
     } else if (action.type === "draw") {
+      if (!player || !viewer.playerId) throw new Error("房主席不参与搜证");
       if (!phase.allowedActions.includes("search")) throw new Error("当前阶段不能搜证");
       room.game = drawClue(room.script, room.game, viewer.playerId, action.deckId, action.category, action.targetRoleId, action.targetClueId);
     } else if (action.type === "triggerSpecial") {
+      if (!player || !viewer.playerId) throw new Error("房主席不参与搜证");
       if (!phase.allowedActions.includes("search")) throw new Error("当前阶段不能触发特殊线索");
       room.game = triggerSpecialClue(room.script, room.game, viewer.playerId, action.clueId);
     } else if (action.type === "conclusion") {
+      if (!player) throw new Error("房主席不提交玩家结论");
       const text = action.text.trim().slice(0, 200);
       if (!text) throw new Error("讨论结论不能为空");
       room.game.eventLog.push(`${player.name}：${text}`);
     } else if (action.type === "vote") {
+      if (!player) throw new Error("房主席不参与最终指认");
       if (!phase.allowedActions.includes("vote")) throw new Error("当前阶段不能指认");
       if (player.voteRoleId) throw new Error("你已经完成最终指认");
       const target = room.script.roles.find((role) => role.id === action.roleId);
@@ -277,7 +309,7 @@ export async function applyRoomAction(code: string, token: string, action: RoomA
       }
     }
 
-    room.lastSeen[viewer.playerId] = new Date().toISOString();
+    room.lastSeen[viewer.playerId ?? "host"] = new Date().toISOString();
     room.revision += 1;
     room.updatedAt = new Date().toISOString();
     await writeRoom(room, override);
@@ -288,6 +320,7 @@ export async function applyRoomAction(code: string, token: string, action: RoomA
 export async function getRoomDmContext(code: string, token: string, override?: string) {
   const room = await readRoom(code, override);
   const viewer = authenticate(room, token);
+  if (!viewer.playerId) throw new Error("房主席不使用玩家私密 DM");
   const player = room.game.players.find((item) => item.id === viewer.playerId)!;
   const phase = room.script.phases[room.game.phaseIndex];
   const owned = new Set(room.game.players.flatMap((item) => item.clueIds));
